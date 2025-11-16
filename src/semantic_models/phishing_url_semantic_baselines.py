@@ -1,14 +1,17 @@
 # src/semantic_models/phishing_url_semantic_baselines.py
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, List, Optional
+
 import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report, confusion_matrix,
-    roc_auc_score, average_precision_score
+    roc_auc_score, average_precision_score,
+    accuracy_score, precision_score, recall_score, f1_score
 )
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
@@ -24,6 +27,7 @@ from src.utils.url_parser import URLParser
 
 log = get_logger("Semantic")
 
+
 # =========================
 # 0) Spécification dataset
 # =========================
@@ -33,23 +37,40 @@ class PhiUSIILSpec:
     url_col_candidates: Tuple[str, ...] = ("URL", "url", "Url")
     label_col_candidates: Tuple[str, ...] = ("label", "Label", "target", "Target")
 
-def load_urls_and_labels(spec: PhiUSIILSpec) -> Tuple[pd.Series, pd.Series, Dict[str, Any]]:
-    """
-    Chargement spécifique au dataset phishing URL (mais découplé des modèles).
-    - Localise la colonne URL et la colonne label parmi des candidats.
-    """
-    loader = DataLoader(spec.dataset_id)
-    X_all, y_series, meta = loader.get_xy_as_dataframes()
 
-    # Trouver colonne URL
-    url_col = DataLoader.find_first_column(spec.url_col_candidates, X_all.columns)
-    if url_col is None:
-        raise ValueError(
-            f"Colonne URL introuvable parmi {spec.url_col_candidates}. "
-            f"Colonnes disponibles: {list(X_all.columns)[:15]}..."
-        )
+def load_urls_and_labels(
+    spec: PhiUSIILSpec,
+    df: Optional[pd.DataFrame] = None,
+    url_col_candidates: Optional[Tuple[str, ...]] = None,
+    label_col_candidates: Optional[Tuple[str, ...]] = None,
+) -> Tuple[pd.Series, pd.Series, Dict[str, Any]]:
+    """
+    Si `df` est fourni, on l’utilise (comme les autres modèles tabulaires).
+    Sinon, on charge via DataLoader(UCI).
+    """
+    url_cands = url_col_candidates or spec.url_col_candidates
+    label_cands = label_col_candidates or spec.label_col_candidates
 
-    # Label : cast sécurisé en int si possible
+    if df is None:
+        loader = DataLoader(spec.dataset_id)
+        X_all, y_series, meta = loader.get_xy_as_dataframes()
+        url_col = DataLoader.find_first_column(url_cands, X_all.columns)
+        if url_col is None:
+            raise ValueError(f"Colonne URL introuvable parmi {url_cands}.")
+        urls = X_all[url_col].astype(str)
+    else:
+        # Cherche URL + label dans df fourni
+        url_col = DataLoader.find_first_column(url_cands, df.columns)
+        lab_col = DataLoader.find_first_column(label_cands, df.columns)
+        if url_col is None or lab_col is None:
+            raise ValueError(
+                f"Colonnes introuvables (url={url_cands}, label={label_cands}) dans df."
+            )
+        urls = df[url_col].astype(str)
+        y_series = df[lab_col]
+        meta = {"source": "provided_df"}
+
+    # Label -> int si possible
     y = y_series.copy()
     if not np.issubdtype(y.dtype, np.integer):
         try:
@@ -57,8 +78,8 @@ def load_urls_and_labels(spec: PhiUSIILSpec) -> Tuple[pd.Series, pd.Series, Dict
         except Exception:
             pass
 
-    urls = X_all[url_col].astype(str)
     return urls, y, meta
+
 
 # ============================================
 # 1) Transformeurs texte (réutilisent URLParser)
@@ -67,36 +88,44 @@ class URLCharDocumentTransformer:
     """Transforme une série d’URLs en textes nettoyés pour les char-ngrams (TF-IDF)."""
     def fit(self, X: pd.Series, y=None):
         return self
+
     def transform(self, X: pd.Series, use_tqdm: bool = False) -> List[str]:
         it = pbar(X.astype(str), desc="Cleaning URLs (char-ngrams)") if use_tqdm else X.astype(str)
         return [URLParser.simple_clean(u) for u in it]
+
     def fit_transform(self, X: pd.Series, y=None, use_tqdm: bool = False) -> List[str]:
         return self.transform(X, use_tqdm=use_tqdm)
+
 
 class URLWordTokenTransformer:
     """Transforme une série d’URLs en liste de tokens (mots) pour embeddings (FastText)."""
     def fit(self, X: pd.Series, y=None):
         return self
+
     def transform(self, X: pd.Series, use_tqdm: bool = True) -> List[List[str]]:
         it = pbar(X.astype(str), desc="Tokenizing URLs (word tokens)") if use_tqdm else X.astype(str)
         out: List[List[str]] = []
         for u in it:
             out.append(URLParser.tokenize_words(u))
         return out
+
     def fit_transform(self, X: pd.Series, y=None, use_tqdm: bool = True) -> List[List[str]]:
         return self.transform(X, use_tqdm=use_tqdm)
+
 
 # ============================================
 # 2) Vectoriseur FastText (embeddings moyens)
 # ============================================
 class FastTextEmbedder:
-    def __init__(self,
-                 vector_size: int = 100,
-                 window: int = 5,
-                 min_count: int = 2,
-                 epochs: int = 10,
-                 sg: int = 1,
-                 workers: int = 1):
+    def __init__(
+        self,
+        vector_size: int = 100,
+        window: int = 5,
+        min_count: int = 2,
+        epochs: int = 10,
+        sg: int = 1,
+        workers: int = 1,
+    ):
         self.vector_size = vector_size
         self.window = window
         self.min_count = min_count
@@ -106,15 +135,18 @@ class FastTextEmbedder:
         self.model: Optional[FastText] = None
 
     def fit(self, token_lists: List[List[str]]):
-        with task(log, f"FastText build (vs={self.vector_size}, win={self.window}, "
-                       f"min={self.min_count}, ep={self.epochs}, sg={self.sg}, workers={self.workers})"):
+        with task(
+            log,
+            f"FastText build (vs={self.vector_size}, win={self.window}, "
+            f"min={self.min_count}, ep={self.epochs}, sg={self.sg}, workers={self.workers})"
+        ):
             self.model = FastText(
                 sentences=token_lists,
                 vector_size=self.vector_size,
                 window=self.window,
                 min_count=self.min_count,
                 sg=self.sg,
-                workers=self.workers
+                workers=self.workers,
             )
             log.info(f"Vocab size: {len(self.model.wv)}")
 
@@ -139,11 +171,13 @@ class FastTextEmbedder:
         self.fit(token_lists)
         return self.transform(token_lists)
 
+
 # ============================================
 # 3) Évaluation commune
 # ============================================
 def evaluate_binary(y_true, scores_continuous, y_pred_labels) -> Dict[str, Any]:
-    out = {}
+    out: Dict[str, Any] = {}
+    # seuil-indep metrics
     try:
         out["roc_auc"] = roc_auc_score(y_true, scores_continuous)
     except Exception:
@@ -152,26 +186,77 @@ def evaluate_binary(y_true, scores_continuous, y_pred_labels) -> Dict[str, Any]:
         out["pr_auc"] = average_precision_score(y_true, scores_continuous)
     except Exception:
         out["pr_auc"] = np.nan
+    # seuil-dep metrics
+    out["accuracy"] = float(accuracy_score(y_true, y_pred_labels))
+    out["precision"] = float(precision_score(y_true, y_pred_labels))
+    out["recall"] = float(recall_score(y_true, y_pred_labels))
+    out["f1"] = float(f1_score(y_true, y_pred_labels))
+    # report + CM
     out["report"] = classification_report(y_true, y_pred_labels, digits=3)
     out["confusion_matrix"] = confusion_matrix(y_true, y_pred_labels)
     return out
 
+
 def print_eval(title: str, res: Dict[str, Any]):
     # Gardé pour compatibilité avec les sorties textuelles existantes.
     print(f"\n=== {title} ===")
-    print(f"ROC-AUC: {res['roc_auc']:.4f}" if not np.isnan(res['roc_auc']) else "ROC-AUC: n/a")
-    print(f"PR-AUC : {res['pr_auc']:.4f}" if not np.isnan(res['pr_auc']) else "PR-AUC : n/a")
+    print(f"ROC-AUC: {res.get('roc_auc', float('nan')):.4f}")
+    print(f"PR-AUC : {res.get('pr_auc', float('nan')):.4f}")
+    print(
+        f"Acc: {res['accuracy']:.4f} | Prec: {res['precision']:.4f} | "
+        f"Rec: {res['recall']:.4f} | F1: {res['f1']:.4f}"
+    )
     print("\n-- Classification report --")
     print(res["report"])
     print("-- Confusion matrix --")
     print(res["confusion_matrix"])
 
+
+# ============================================
+# 3.5) Signaux lexicaux & top n-grams
+# ============================================
+def compute_lexical_signals(urls: pd.Series) -> Dict[str, Any]:
+    s = urls.astype(str)
+    n = len(s)
+    lengths = s.str.len()
+    denom = lengths.replace(0, np.nan)
+
+    digit_ratio = s.str.count(r"\d") / denom
+    special_ratio = s.str.count(r"[^A-Za-z0-9]") / denom
+    alpha_ratio = s.str.count(r"[A-Za-z]") / denom
+
+    return {
+        "n_urls": int(n),
+        "length_mean": float(lengths.mean()),
+        "length_std": float(lengths.std(ddof=0)),
+        "digit_ratio_mean": float(digit_ratio.mean()),
+        "special_char_ratio_mean": float(special_ratio.mean()),
+        "alpha_ratio_mean": float(alpha_ratio.mean()),
+        "length_describe": lengths.describe(),
+    }
+
+
+def get_tfidf_top_ngrams(vectorizer: TfidfVectorizer, clf: LinearSVC, n: int = 20) -> Dict[str, List[str]]:
+    names = np.array(vectorizer.get_feature_names_out())
+    coefs = clf.coef_[0]
+    top_phishing_idx = np.argsort(coefs)[-n:][::-1]
+    top_legit_idx = np.argsort(coefs)[:n]
+    return {
+        "top_phishing_ngrams": names[top_phishing_idx].tolist(),
+        "top_legit_ngrams": names[top_legit_idx].tolist(),
+    }
+
+
 # ============================================
 # 4) Pipelines modèles (spécifiques)
 # ============================================
 def train_tfidf_char_svc(
-    urls_train: pd.Series, urls_test: pd.Series, y_train: pd.Series, y_test: pd.Series,
-    ngram_range: Tuple[int, int] = (3, 5), max_features: int = 50000
+    urls_train: pd.Series,
+    urls_test: pd.Series,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    ngram_range: Tuple[int, int] = (3, 5),
+    max_features: int = 50000,
 ) -> Dict[str, Any]:
     """
     Baseline sémantique forte : TF-IDF de n-grammes de caractères + LinearSVC.
@@ -185,7 +270,7 @@ def train_tfidf_char_svc(
         analyzer="char",
         ngram_range=ngram_range,
         lowercase=False,
-        max_features=max_features
+        max_features=max_features,
     )
     Xtr = tfidf.fit_transform(tr_txt)
     Xte = tfidf.transform(te_txt)
@@ -200,16 +285,25 @@ def train_tfidf_char_svc(
 
     out = evaluate_binary(y_test, scores, y_pred)
     out.update({"vectorizer": tfidf, "clf": clf, "char_transformer": char_tf})
+    out.update(get_tfidf_top_ngrams(tfidf, clf, n=20))  # top n-grams for interpretability
     return out
 
+
 def train_fasttext_logreg(
-    urls_train: pd.Series, urls_test: pd.Series, y_train: pd.Series, y_test: pd.Series,
-    vector_size: int = 100, window: int = 5, min_count: int = 5, epochs: int = 3, sg: int = 1,
+    urls_train: pd.Series,
+    urls_test: pd.Series,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    vector_size: int = 100,
+    window: int = 5,
+    min_count: int = 5,
+    epochs: int = 3,
+    sg: int = 1,
     C: float = 1.0,
     workers: int = 1,
     fast_mode: bool = True,
     train_frac: float = 0.25,
-    random_state: int = 42
+    random_state: int = 42,
 ) -> Dict[str, Any]:
     """
     Embeddings FastText (moyenne par URL) + Logistic Regression.
@@ -237,9 +331,9 @@ def train_fasttext_logreg(
         min_count=min_count,
         epochs=epochs,
         sg=sg,
-        workers=workers
+        workers=workers,
     )
-    _ = ft.fit_transform(tr_tokens)  # embeddings pour l'échantillon d'entraînement (fit + transform)
+    _ = ft.fit_transform(tr_tokens)  # fit + quick embeddings on the sampled set (for timing symmetry)
 
     # Embeddings pour tout le train/test à partir du modèle appris
     log.info("[FastText+LR] Embedding FULL train/test sets")
@@ -256,25 +350,28 @@ def train_fasttext_logreg(
 
     out = evaluate_binary(y_test, prob, y_pred)
     out.update({"embedder": ft, "token_transformer": tok_tf, "clf": clf})
+    out.update({"fasttext_vocab_size": int(len(ft.model.wv)) if ft.model else 0})
     return out
+
 
 # ============================================
 # 5) Routine de comparaison réutilisable
 # ============================================
 def train_and_compare_semantic_baselines(
     spec: PhiUSIILSpec = PhiUSIILSpec(),
+    df: Optional[pd.DataFrame] = None,          # NEW: allow passing a preloaded dataframe
     test_size: float = 0.2,
     random_state: int = 42,
     run_char_tfidf: bool = True,
     run_fasttext: bool = True,
-    fasttext_fast_mode: bool = True
+    fasttext_fast_mode: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Charge les URLs + labels du dataset PhishU et entraîne les 2 baselines sémantiques.
-    Retourne un dict avec résultats + objets utiles (vectorizers, modèles...).
+    Charge les URLs + labels (depuis df si fourni, sinon UCI) et entraîne les 2 baselines sémantiques.
+    Retourne un dict avec résultats + objets utiles (vectorizers, modèles...) et des infos lexicales.
     """
     log.info("[Data] Loading URLs & labels")
-    urls, y, _meta = load_urls_and_labels(spec)
+    urls, y, _meta = load_urls_and_labels(spec, df=df)
 
     log.info("[Data] Train/test split")
     X_train, X_test, y_train, y_test = train_test_split(
@@ -282,7 +379,11 @@ def train_and_compare_semantic_baselines(
     )
     log.info(f"[Data] Train={len(X_train)} | Test={len(X_test)}")
 
-    results = {}
+    # signaux lexicaux globaux (sur le test pour reporting)
+    lexical = compute_lexical_signals(X_test)
+
+    results: Dict[str, Dict[str, Any]] = {"lexical_signals": lexical}
+
     if run_char_tfidf:
         res1 = train_tfidf_char_svc(X_train, X_test, y_train, y_test)
         print_eval("TF-IDF char (3–5) + LinearSVC", res1)
@@ -298,6 +399,7 @@ def train_and_compare_semantic_baselines(
         results["fasttext_logreg"] = res2
 
     return results
+
 
 # ============================================
 # 6) Exécution directe

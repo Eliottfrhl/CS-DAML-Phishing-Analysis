@@ -14,7 +14,7 @@ CentraleSupélec Project made for the Data Analytics &amp; Machine Learning Cour
 - Run the cells in order : the notebook downloads the dataset and trains the models by itself
 
 **Results**
-All the output graphs will be located in the `outputs/` folder, and the last cell of the notebook provides a sum-up of the performances of the various models that were implemented.
+All the output graphs will be located in the `outputs/` folder and `plots/` for semantic models, and the last cell of the notebook provides a sum-up of the performances of the various models that were implemented. 
 
 ## Ressources
 [PhiUSIIL Phishing URL (Website)](https://archive.ics.uci.edu/dataset/967/phiusiil+phishing+url+dataset)
